@@ -22,7 +22,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::panic::{self, PanicHookInfo};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio, Termination};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use std::{env, str};
@@ -195,7 +195,7 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
 
     let sopts = config::build_session_options(&mut default_early_dcx, &matches);
     // fully initialize ice path static once unstable options are available as context
-    let ice_file = ice_path_with_config(Some(&sopts.unstable_opts)).clone();
+    let ice_file = ice_path_with_config(Some(&sopts.unstable_opts));
 
     if let Some(ref code) = matches.opt_str("explain") {
         handle_explain(&default_early_dcx, code, sopts.color);
@@ -1384,7 +1384,18 @@ pub fn catch_with_exit_code<T: Termination>(f: impl FnOnce() -> T) -> ExitCode {
     }
 }
 
-static ICE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// Where to write ICE reports, once derived from the environment and flags.
+///
+/// A `OnceLock` would fit better, but the compile server needs to be able to
+/// clear this in a forked child: the inherited value was derived from the
+/// server's environment, not from the compilation the child is about to run.
+static ICE_PATH: RwLock<Option<Option<PathBuf>>> = RwLock::new(None);
+
+/// Clears [`ICE_PATH`] so that it is re-derived. Only for the compile server;
+/// see the note there.
+fn reset_ice_path() {
+    *ICE_PATH.write().unwrap() = None;
+}
 
 // This function should only be called from the ICE hook.
 //
@@ -1393,18 +1404,21 @@ static ICE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 //
 // Subsequent calls to either function will then return the proper ICE path as configured by
 // the environment and cli flags
-fn ice_path() -> &'static Option<PathBuf> {
+fn ice_path() -> Option<PathBuf> {
     ice_path_with_config(None)
 }
 
-fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<PathBuf> {
-    if ICE_PATH.get().is_some() && config.is_some() && cfg!(debug_assertions) {
-        tracing::warn!(
-            "ICE_PATH has already been initialized -- files may be emitted at unintended paths"
-        )
+fn ice_path_with_config(config: Option<&UnstableOptions>) -> Option<PathBuf> {
+    if let Some(path) = &*ICE_PATH.read().unwrap() {
+        if config.is_some() && cfg!(debug_assertions) {
+            tracing::warn!(
+                "ICE_PATH has already been initialized -- files may be emitted at unintended paths"
+            )
+        }
+        return path.clone();
     }
 
-    ICE_PATH.get_or_init(|| {
+    let derive = || {
         if !rustc_feature::UnstableFeatures::from_environment(None).is_nightly_build() {
             return None;
         }
@@ -1414,8 +1428,12 @@ fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<Pat
                     // Explicitly opting out of writing ICEs to disk.
                     return None;
                 }
-                if let Some(unstable_opts) = config && unstable_opts.metrics_dir.is_some() {
-                    tracing::warn!("ignoring -Zmetrics-dir in favor of RUSTC_ICE for destination of ICE report files");
+                if let Some(unstable_opts) = config
+                    && unstable_opts.metrics_dir.is_some()
+                {
+                    tracing::warn!(
+                        "ignoring -Zmetrics-dir in favor of RUSTC_ICE for destination of ICE report files"
+                    );
                 }
                 PathBuf::from(s)
             }
@@ -1429,7 +1447,11 @@ fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<Pat
         let pid = std::process::id();
         path.push(format!("rustc-ice-{file_now}-{pid}.txt"));
         Some(path)
-    })
+    };
+
+    let derived = derive();
+    *ICE_PATH.write().unwrap() = Some(derived.clone());
+    derived
 }
 
 pub static USING_INTERNAL_FEATURES: AtomicBool = AtomicBool::new(false);
@@ -1563,9 +1585,9 @@ fn report_ice(
 
     let file = if let Some(path) = ice_path() {
         // Create the ICE dump target file.
-        match crate::fs::File::options().create(true).append(true).open(path) {
+        match crate::fs::File::options().create(true).append(true).open(&path) {
             Ok(mut file) => {
-                dcx.emit_note(session_diagnostics::IcePath { path: path.clone() });
+                dcx.emit_note(session_diagnostics::IcePath { path });
                 if FIRST_PANIC.swap(false, Ordering::SeqCst) {
                     let _ = write!(file, "\n\nrustc version: {version}\nplatform: {tuple}");
                 }
@@ -1673,12 +1695,12 @@ pub fn install_ctrlc_handler() {
 /// per request: the child inherits the warm address space copy-on-write and
 /// starts compiling immediately.
 ///
-/// The server deliberately never compiles anything itself. Doing so would warm
-/// its pages further, but it would also initialise one-shot globals -- the
-/// `-Z threads` mode, the ICE dump path -- that every later child would then
-/// inherit instead of setting from its own arguments. Children set them in
-/// their own copy-on-write memory, so forking from a pristine server keeps each
-/// compilation exactly as isolated as its own process was.
+/// Warming the server means it has run a compilation, which initialises globals
+/// that must instead reflect each child's own arguments: the `-Z threads` mode,
+/// the ICE dump path, and the ICE hook's view of `RUST_BACKTRACE`. Children
+/// therefore clear the first two and install the hook themselves, all of which
+/// they do in their own copy-on-write memory, so a warmed server still hands
+/// out compilations as isolated as their own processes were.
 ///
 /// The protocol is deliberately minimal, and is spoken over stdin (which the
 /// client makes a socketpair so it can be read from and written to). One
@@ -1689,7 +1711,10 @@ pub fn install_ctrlc_handler() {
 /// ```
 ///
 /// where `<env>` and `<args>` are themselves `\x02`-separated, and `<env>`
-/// entries are `KEY=VALUE`.
+/// entries are `KEY=VALUE`. A request whose `cwd` is `WARMUP` is run in the
+/// server itself, so that the pages it touches -- and, more importantly, the
+/// heap the allocator has grown to hold a session -- stay resident and are
+/// inherited copy-on-write by every later child.
 ///
 /// The reply is `##EXIT <code>` or, if the child was killed by a signal,
 /// `##SIGNAL <signo>`, so that tests which expect a specific exit status or a
@@ -1713,6 +1738,13 @@ fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
         let env = field(&mut parts, "env");
         let args: Vec<String> =
             field(&mut parts, "args").split('\x02').map(str::to_owned).collect();
+
+        if cwd == "WARMUP" {
+            let _ = catch_fatal_errors(|| run_compiler(&args, callbacks));
+            write!(io::stdout(), "##EXIT 0\n").unwrap();
+            io::stdout().flush().unwrap();
+            continue;
+        }
 
         // SAFETY: the server is single-threaded, and everything the child does
         // before handing over to the compiler is async-signal-safe or covered
@@ -1743,9 +1775,10 @@ fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
                 unsafe { env::set_var(key, value) };
             }
 
-            // The ICE hook reads `RUST_BACKTRACE` when it is installed, so it
-            // has to be reinstalled now that this compilation's environment is
-            // in place -- the server installed it under its own.
+            // Clear what a warmup left behind: these must come from this
+            // compilation's own arguments and environment, not the server's.
+            rustc_data_structures::sync::reset_dyn_thread_safe_mode();
+            reset_ice_path();
             install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
 
             let code = catch_with_exit_code(|| run_compiler(&args, callbacks));

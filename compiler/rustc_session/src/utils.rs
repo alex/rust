@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use rustc_data_structures::profiling::VerboseTimingGuard;
 use rustc_fs_util::try_canonicalize;
@@ -67,11 +67,14 @@ impl CanonicalizedPath {
 /// separately because it need not be: under `rustc`'s compile server a
 /// compilation runs in a process whose `argv` belongs to the server, not to the
 /// compilation. ICE reports want the latter.
-static INVOCATION_ARGS: OnceLock<Vec<String>> = OnceLock::new();
+static INVOCATION_ARGS: RwLock<Option<Vec<String>>> = RwLock::new(None);
 
 /// Records the arguments of the compilation about to run, for ICE reports.
+///
+/// Overwrites rather than initialising once, since a compile server runs more
+/// than one compilation per process image.
 pub fn set_invocation_args(args: &[String]) {
-    let _ = INVOCATION_ARGS.set(args.to_vec());
+    *INVOCATION_ARGS.write().unwrap() = Some(args.to_vec());
 }
 
 pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
@@ -81,12 +84,8 @@ pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
 
     const ICE_REPORT_COMPILER_FLAGS_STRIP_VALUE: &[&str] = &["incremental"];
 
-    let invocation_args;
-    let mut args: Box<dyn Iterator<Item = String>> = match INVOCATION_ARGS.get() {
-        Some(args) => {
-            invocation_args = args.clone();
-            Box::new(invocation_args.into_iter())
-        }
+    let mut args: Box<dyn Iterator<Item = String>> = match INVOCATION_ARGS.read().unwrap().clone() {
+        Some(args) => Box::new(args.into_iter()),
         None => Box::new(std::env::args_os().map(|arg| arg.to_string_lossy().to_string())),
     };
 

@@ -35,7 +35,8 @@ pub use self::freeze::{FreezeLock, FreezeReadGuard, FreezeWriteGuard};
 #[doc(no_inline)]
 pub use self::lock::{Lock, LockGuard, Mode};
 pub use self::mode::{
-    FromDyn, check_dyn_thread_safe, is_dyn_thread_safe, set_dyn_thread_safe_mode,
+    FromDyn, check_dyn_thread_safe, is_dyn_thread_safe, reset_dyn_thread_safe_mode,
+    set_dyn_thread_safe_mode,
 };
 pub use self::parallel::{
     broadcast, par_fns, par_for_each_in, par_for_each_slice, par_join, par_map, parallel_guard,
@@ -63,7 +64,7 @@ mod atomic {
     pub use portable_atomic::AtomicU64;
 }
 
-mod mode {
+pub mod mode {
     use std::sync::atomic::{AtomicU8, Ordering};
 
     use crate::sync::{DynSend, DynSync};
@@ -94,6 +95,16 @@ mod mode {
     #[inline]
     pub(super) fn might_be_dyn_thread_safe() -> bool {
         DYN_THREAD_SAFE_MODE.load(Ordering::Relaxed) != DYN_NOT_THREAD_SAFE
+    }
+
+    /// Clears the mode, so that it can be set again for a different compilation.
+    ///
+    /// Only for `rustc`'s compile server: a forked child inherits the mode of
+    /// whatever the server last did, but must use the mode its own `-Z threads`
+    /// asks for. The child writes to its own copy-on-write memory, so this
+    /// cannot affect the server or any other child.
+    pub fn reset_dyn_thread_safe_mode() {
+        DYN_THREAD_SAFE_MODE.store(UNINITIALIZED, Ordering::Relaxed);
     }
 
     // Only set by the `-Z threads` compile option

@@ -1649,6 +1649,7 @@ impl<'test> TestCx<'test> {
         if let Some(server) = &self.config.compile_server
             && input.is_none()
             && command.get_program() == self.config.rustc_path.as_std_path()
+            && server.can_serve(&command)
         {
             let served = server.run(&command);
             let (stdout, stderr, truncated) =

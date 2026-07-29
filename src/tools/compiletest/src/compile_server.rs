@@ -44,6 +44,11 @@ pub(crate) struct Served {
 #[derive(Debug)]
 pub(crate) struct ServerPool {
     rustc: Utf8PathBuf,
+    /// Flags to warm a new server with, so that it loads the same standard
+    /// library the tests will use.
+    warmup_flags: Vec<String>,
+    /// The target servers are warmed for; see [`Self::can_serve`].
+    target: String,
     scratch_root: Utf8PathBuf,
     idle: Mutex<Vec<Server>>,
     next_id: AtomicUsize,
@@ -51,7 +56,12 @@ pub(crate) struct ServerPool {
 
 impl ServerPool {
     /// Creates a pool, if the caller asked for one.
-    pub(crate) fn new(rustc: &Utf8Path, scratch_root: &Utf8Path) -> Option<Self> {
+    pub(crate) fn new(
+        rustc: &Utf8Path,
+        sysroot: &Utf8Path,
+        target: &str,
+        scratch_root: &Utf8Path,
+    ) -> Option<Self> {
         if env::var_os("COMPILETEST_COMPILE_SERVER").is_none() {
             return None;
         }
@@ -59,6 +69,12 @@ impl ServerPool {
         fs::create_dir_all(&scratch_root).ok()?;
         Some(Self {
             rustc: rustc.to_path_buf(),
+            warmup_flags: vec![
+                "--sysroot".to_owned(),
+                sysroot.as_str().to_owned(),
+                format!("--target={target}"),
+            ],
+            target: target.to_owned(),
             scratch_root,
             idle: Mutex::new(vec![]),
             next_id: AtomicUsize::new(0),
@@ -90,7 +106,63 @@ impl ServerPool {
             .expect("failed to start compile server");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Server { child, stdin, stdout, scratch }
+        let mut server = Server { child, stdin, stdout, scratch };
+
+        // Have the server compile something once, so that the heap it grew to
+        // hold a session -- and the pages that took -- are resident and
+        // inherited by every child instead of being rebuilt by each of them.
+        // Use the flags the tests use, so the standard library gets loaded too.
+        let src = server.scratch.join("warmup.rs");
+        fs::write(&src, "pub fn warm() {}\n").expect("failed to write warmup source");
+        let mut args = vec![self.rustc.as_str().to_owned()];
+        args.extend(self.warmup_flags.iter().cloned());
+        args.extend([
+            "--crate-type=lib".to_owned(),
+            "--emit=metadata".to_owned(),
+            "--out-dir".to_owned(),
+            server.scratch.as_str().to_owned(),
+            src.as_str().to_owned(),
+        ]);
+        server.request("WARMUP", "", "", &[], &args);
+
+        server
+    }
+
+    /// Whether `command` can be served, or whether it has to have a process of
+    /// its own.
+    ///
+    /// A warmed server has already initialised things that the compiler only
+    /// initialises once per process image and that depend on the compilation:
+    /// the codegen backend is loaded, LLVM is set up for one target with one set
+    /// of `-C llvm-args`, and `RUST_MIN_STACK` has been read. A child cannot
+    /// redo any of that, so a compilation that would configure them differently
+    /// is not interchangeable with the one the server was warmed with, and gets
+    /// a process of its own.
+    pub(crate) fn can_serve(&self, command: &Command) -> bool {
+        let mut target = None;
+        for arg in command.get_args() {
+            let arg = arg.to_string_lossy();
+            // Configures LLVM, or asks it something.
+            if arg.starts_with("-Cllvm-args")
+                || arg.starts_with("-Ctarget-cpu")
+                || arg.starts_with("-Ctarget-feature")
+                || arg.starts_with("-Zcodegen-backend")
+                || arg.starts_with("--print")
+            {
+                return false;
+            }
+            if let Some(value) = arg.strip_prefix("--target") {
+                target = Some(value.trim_start_matches('=').to_owned());
+            }
+        }
+        // A compilation for some other target needs LLVM set up for it.
+        if target.is_some_and(|target| target != self.target) {
+            return false;
+        }
+        // Read once, on first use, and then cached by the standard library.
+        !command
+            .get_envs()
+            .any(|(key, value)| key == "RUST_MIN_STACK" && value != Some("".as_ref()))
     }
 
     /// Runs `command` on a server, returning what it would have produced as its

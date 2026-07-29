@@ -386,7 +386,9 @@ pub(crate) fn parse_config(args: Vec<String>) -> Config {
     let iteration_count = args.iteration_count.unwrap_or(Config::DEFAULT_ITERATION_COUNT);
     assert!(iteration_count > 0, "`--iteration-count` must be a positive integer");
 
-    let compile_server = ServerPool::new(&args.rustc_path, &build_test_suite_root).map(Arc::new);
+    let compile_server =
+        ServerPool::new(&args.rustc_path, &args.sysroot_base, &args.target, &build_test_suite_root)
+            .map(Arc::new);
 
     Config {
         bless: args.bless,
