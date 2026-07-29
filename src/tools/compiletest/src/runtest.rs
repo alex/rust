@@ -222,6 +222,20 @@ struct TestCx<'test> {
     variant: &'test TestVariant,
 }
 
+/// Paths that [`TestCx::normalize_output_with`] replaces with placeholders,
+/// resolved once by [`TestCx::normalize_paths`].
+struct NormalizePaths {
+    /// Real path of the standard library sources (`$SRC_DIR_REAL`).
+    rust_src_dir: Utf8PathBuf,
+    /// Real path of the compiler sources (`$COMPILER_DIR_REAL`).
+    rustc_src_dir: Utf8PathBuf,
+    /// This test's output directory (`$TEST_BUILD_DIR`).
+    output_base_dir: Utf8PathBuf,
+    /// Same as [`Self::output_base_dir`], but canonicalized, since some tests
+    /// print paths that have had their symlinks resolved.
+    output_base_dir_canonical: Utf8PathBuf,
+}
+
 enum ReadFrom {
     Path,
     Stdin(String),
@@ -694,9 +708,12 @@ impl<'test> TestCx<'test> {
             .collect();
 
         // Parse the JSON output from the compiler and extract out the messages.
+        // Every message gets normalized, so resolve the paths involved up front
+        // instead of once per diagnostic.
+        let normalize_paths = self.normalize_paths();
         let actual_errors = json::parse_output(&diagnostic_file_name, &self.get_output(proc_res))
             .into_iter()
-            .map(|e| Error { msg: self.normalize_output(&e.msg, &[]), ..e });
+            .map(|e| Error { msg: self.normalize_output_with(&normalize_paths, &e.msg, &[]), ..e });
 
         let mut unexpected = Vec::new();
         let mut unimportant = Vec::new();
@@ -2355,8 +2372,12 @@ impl<'test> TestCx<'test> {
         let expected_stderr = self.load_expected_output(stderr_kind);
         let expected_stdout = self.load_expected_output(stdout_kind);
 
-        let mut normalized_stdout =
-            self.normalize_output(&proc_res.stdout, &self.props.normalize_stdout);
+        let normalize_paths = self.normalize_paths();
+        let mut normalized_stdout = self.normalize_output_with(
+            &normalize_paths,
+            &proc_res.stdout,
+            &self.props.normalize_stdout,
+        );
         match output_kind {
             TestOutput::Run if self.config.remote_test_client.is_some() => {
                 // When tests are run using the remote-test-client, the string
@@ -2383,7 +2404,11 @@ impl<'test> TestCx<'test> {
         let normalized_stderr;
 
         if self.force_color_svg() {
-            let normalized = self.normalize_output(&proc_res.stderr, &self.props.normalize_stderr);
+            let normalized = self.normalize_output_with(
+                &normalize_paths,
+                &proc_res.stderr,
+                &self.props.normalize_stderr,
+            );
             stderr = anstyle_svg::Term::new().render_svg(&normalized);
             normalized_stderr = stderr.clone();
         } else {
@@ -2392,7 +2417,8 @@ impl<'test> TestCx<'test> {
             } else {
                 json::extract_rendered(&proc_res.stderr)
             };
-            normalized_stderr = self.normalize_output(&stderr, &self.props.normalize_stderr);
+            normalized_stderr =
+                self.normalize_output_with(&normalize_paths, &stderr, &self.props.normalize_stderr);
         }
 
         let mut errors = 0;
@@ -2444,7 +2470,45 @@ impl<'test> TestCx<'test> {
         errors
     }
 
+    /// Resolves the paths that [`Self::normalize_output`] substitutes out of
+    /// test output.
+    ///
+    /// Doing this involves several filesystem lookups (including a
+    /// `canonicalize`, which resolves every component of the path), and the
+    /// answers don't change over the lifetime of a test, so callers that
+    /// normalize more than one string should resolve them once and pass the
+    /// result to [`Self::normalize_output_with`].
+    fn normalize_paths(&self) -> NormalizePaths {
+        // Real paths into the libstd/libcore.
+        let rust_src_dir = self.config.sysroot_base.join("lib/rustlib/src/rust");
+        rust_src_dir
+            .try_exists()
+            .unwrap_or_else(|e| panic!("failed to check whether {rust_src_dir} exists: {e}"));
+        let rust_src_dir = rust_src_dir.read_link_utf8().unwrap_or(rust_src_dir);
+
+        // Real paths into the compiler.
+        let rustc_src_dir = self.config.sysroot_base.join("lib/rustlib/rustc-src/rust");
+        rustc_src_dir
+            .try_exists()
+            .unwrap_or_else(|e| panic!("failed to check whether {rustc_src_dir} exists: {e}"));
+        let rustc_src_dir = rustc_src_dir.read_link_utf8().unwrap_or(rustc_src_dir);
+
+        let output_base_dir = self.output_base_dir();
+        let output_base_dir_canonical = output_base_dir.canonicalize_utf8().unwrap();
+
+        NormalizePaths { rust_src_dir, rustc_src_dir, output_base_dir, output_base_dir_canonical }
+    }
+
     fn normalize_output(&self, output: &str, custom_rules: &[(String, String)]) -> String {
+        self.normalize_output_with(&self.normalize_paths(), output, custom_rules)
+    }
+
+    fn normalize_output_with(
+        &self,
+        paths: &NormalizePaths,
+        output: &str,
+        custom_rules: &[(String, String)],
+    ) -> String {
         // Crude heuristic to detect when the output should have JSON-specific
         // normalization steps applied.
         let rflags = self.props.run_flags.join(" ");
@@ -2486,28 +2550,21 @@ impl<'test> TestCx<'test> {
         normalize_path(&base_dir.join("compiler"), "$COMPILER_DIR");
 
         // Real paths into the libstd/libcore
-        let rust_src_dir = &self.config.sysroot_base.join("lib/rustlib/src/rust");
-        rust_src_dir.try_exists().expect(&*format!("{} should exists", rust_src_dir));
-        let rust_src_dir =
-            rust_src_dir.read_link_utf8().unwrap_or_else(|_| rust_src_dir.to_path_buf());
-        normalize_path(&rust_src_dir.join("library"), "$SRC_DIR_REAL");
+        normalize_path(&paths.rust_src_dir.join("library"), "$SRC_DIR_REAL");
 
         // Real paths into the compiler
-        let rustc_src_dir = &self.config.sysroot_base.join("lib/rustlib/rustc-src/rust");
-        rustc_src_dir.try_exists().expect(&*format!("{} should exists", rustc_src_dir));
-        let rustc_src_dir = rustc_src_dir.read_link_utf8().unwrap_or(rustc_src_dir.to_path_buf());
-        normalize_path(&rustc_src_dir.join("compiler"), "$COMPILER_DIR_REAL");
+        normalize_path(&paths.rustc_src_dir.join("compiler"), "$COMPILER_DIR_REAL");
 
         // eg.
         // /home/user/rust/build/x86_64-unknown-linux-gnu/test/ui/<test_dir>/$name.$revision.$mode/
-        normalize_path(&self.output_base_dir(), "$TEST_BUILD_DIR");
+        normalize_path(&paths.output_base_dir, "$TEST_BUILD_DIR");
         // Same as above, but with a canonicalized path.
         // This is required because some tests print canonical paths inside test build directory,
         // so if the build directory is a symlink, normalization doesn't help.
         //
         // NOTE: There are also tests which print the non-canonical name, so we need both this and
         // the above normalizations.
-        normalize_path(&self.output_base_dir().canonicalize_utf8().unwrap(), "$TEST_BUILD_DIR");
+        normalize_path(&paths.output_base_dir_canonical, "$TEST_BUILD_DIR");
         // eg. /home/user/rust/build
         normalize_path(&self.config.build_root, "$BUILD_DIR");
 
