@@ -216,7 +216,7 @@ use std::borrow::Cow;
 use std::io::{self, Error as IoError, ErrorKind as IoErrorKind, Result as IoResult, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::{cmp, fmt};
+use std::{cmp, fmt, fs};
 
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
@@ -426,6 +426,13 @@ impl<'a> CrateLocator<'a> {
             debug!("searching {}", search_path.dir.display());
             let spf = &search_path.files;
 
+            // Canonicalizing a path resolves every one of its components, and
+            // below we canonicalize one path per candidate file in this
+            // directory, of which the sysroot alone holds dozens. Resolve the
+            // directory part of that work once here instead, and reuse it for
+            // every candidate whose file name is not itself a symlink.
+            let canonical_dir = try_canonicalize(&search_path.dir).ok();
+
             let mut should_check_staticlibs = true;
             for (prefix, suffix, kind) in [
                 (rlib_prefix.as_str(), rlib_suffix, CrateFlavor::Rlib),
@@ -448,8 +455,21 @@ impl<'a> CrateLocator<'a> {
                             // ones we've already seen. This allows us to ignore crates
                             // we know are exactual equal to ones we've already found.
                             // Going to the same crate through different symlinks does not change the result.
-                            let path =
-                                try_canonicalize(&spf_path).unwrap_or_else(|_| spf_path.clone());
+                            //
+                            // If the file itself is not a symlink then appending its name to
+                            // the already-resolved directory gives the same answer as resolving
+                            // the whole path, for a single `lstat` instead of a `readlink` per
+                            // path component.
+                            let is_symlink = fs::symlink_metadata(&spf_path)
+                                .map(|meta| meta.file_type().is_symlink());
+                            let path = match (&canonical_dir, spf_path.file_name(), is_symlink) {
+                                (Some(canonical_dir), Some(file_name), Ok(false)) => {
+                                    canonical_dir.join(file_name)
+                                }
+                                _ => {
+                                    try_canonicalize(&spf_path).unwrap_or_else(|_| spf_path.clone())
+                                }
+                            };
                             if seen_paths.contains(&path) {
                                 continue;
                             };
