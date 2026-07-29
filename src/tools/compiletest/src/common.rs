@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use build_helper::git::GitConfig;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -13,6 +13,7 @@ use crate::debuggers::LldbVersion;
 use crate::edition::Edition;
 use crate::executor::TestVariant;
 use crate::fatal;
+use crate::runtest::AuxCache;
 use crate::util::{Utf8PathBufExt, add_dylib_path, string_enum};
 
 string_enum! {
@@ -763,6 +764,11 @@ pub(crate) struct Config {
     pub(crate) parallel_frontend_threads: u32,
     /// Number of times to execute each test.
     pub(crate) iteration_count: u32,
+
+    /// Auxiliary crate builds shared between the tests that ask for them.
+    ///
+    /// FIXME: this is not a "config" either; see the comment on `target_cfgs`.
+    pub(crate) aux_cache: Arc<AuxCache>,
 }
 
 impl Config {

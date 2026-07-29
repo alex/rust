@@ -498,5 +498,7 @@ pub(crate) fn parse_config(args: Vec<String>) -> Config {
 
         parallel_frontend_threads,
         iteration_count,
+
+        aux_cache: Default::default(),
     }
 }

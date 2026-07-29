@@ -5,7 +5,7 @@ use std::fs::{self, create_dir_all};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::prelude::*;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::{env, fmt, io, iter, str};
+use std::{env, fmt, io, iter, mem, str};
 
 use build_helper::fs::remove_and_create_dir_all;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -23,6 +23,7 @@ use crate::errors::{Error, ErrorKind, load_errors};
 use crate::executor::TestVariant;
 use crate::output_capture::ConsoleOut;
 use crate::read2::{Truncated, read2_abbreviated};
+use crate::runtest::aux_cache::{AuxBuild, AuxKey};
 use crate::runtest::compute_diff::{DiffLine, diff_by_lines, make_diff, write_diff};
 use crate::util::{ArgFileCommand, Utf8PathBufExt, add_dylib_path, static_regex};
 use crate::{json, stamp_file_path};
@@ -44,6 +45,9 @@ mod rustdoc;
 mod rustdoc_json;
 mod ui;
 // tidy-alphabetical-end
+
+mod aux_cache;
+pub(crate) use aux_cache::AuxCache;
 
 mod compute_diff;
 mod debugger;
@@ -435,7 +439,7 @@ impl<'test> TestCx<'test> {
 
         let mut rustc = Command::new(&self.config.rustc_path);
 
-        self.build_all_auxiliary(&self.aux_output_dir(), &mut rustc);
+        self.build_all_auxiliary(&self.aux_output_dir(), &mut rustc, true);
 
         rustc
             .arg(input)
@@ -1244,13 +1248,20 @@ impl<'test> TestCx<'test> {
         aux_dir
     }
 
-    fn build_all_auxiliary(&self, aux_dir: &Utf8Path, rustc: &mut Command) {
+    /// Builds all of the auxiliaries requested by this test, into `aux_dir`.
+    ///
+    /// `dir_is_empty` says whether `aux_dir` starts out with no auxiliaries in
+    /// it, which determines whether the first auxiliary built can be shared
+    /// with other tests; see [`Self::build_auxiliary`].
+    fn build_all_auxiliary(&self, aux_dir: &Utf8Path, rustc: &mut Command, dir_is_empty: bool) {
+        let mut can_share = dir_is_empty;
+
         for rel_ab in &self.props.aux.builds {
-            self.build_auxiliary(rel_ab, &aux_dir, None);
+            self.build_auxiliary(rel_ab, &aux_dir, None, &mut can_share);
         }
 
         for rel_ab in &self.props.aux.bins {
-            self.build_auxiliary(rel_ab, &aux_dir, Some(AuxType::Bin));
+            self.build_auxiliary(rel_ab, &aux_dir, Some(AuxType::Bin), &mut can_share);
         }
 
         let path_to_crate_name = |path: &str| -> String {
@@ -1276,12 +1287,17 @@ impl<'test> TestCx<'test> {
         };
 
         for AuxCrate { extern_modifiers, name, path } in &self.props.aux.crates {
-            let aux_type = self.build_auxiliary(&path, &aux_dir, None);
+            let aux_type = self.build_auxiliary(&path, &aux_dir, None, &mut can_share);
             add_extern(rustc, extern_modifiers.as_deref(), name, path, aux_type);
         }
 
         for proc_macro in &self.props.aux.proc_macros {
-            self.build_auxiliary(&proc_macro.path, &aux_dir, Some(AuxType::ProcMacro));
+            self.build_auxiliary(
+                &proc_macro.path,
+                &aux_dir,
+                Some(AuxType::ProcMacro),
+                &mut can_share,
+            );
             let crate_name = path_to_crate_name(&proc_macro.path);
             add_extern(
                 rustc,
@@ -1295,7 +1311,7 @@ impl<'test> TestCx<'test> {
         // Build any `//@ aux-codegen-backend`, and pass the resulting library
         // to `-Zcodegen-backend` when compiling the test file.
         if let Some(aux_file) = &self.props.aux.codegen_backend {
-            let aux_type = self.build_auxiliary(aux_file, aux_dir, None);
+            let aux_type = self.build_auxiliary(aux_file, aux_dir, None, &mut can_share);
             if let Some(lib_name) = get_lib_name(aux_file.trim_end_matches(".rs"), aux_type) {
                 let lib_path = aux_dir.join(&lib_name);
                 rustc.arg(format!("-Zcodegen-backend={}", lib_path));
@@ -1313,7 +1329,7 @@ impl<'test> TestCx<'test> {
         }
 
         let aux_dir = self.aux_output_dir();
-        self.build_all_auxiliary(&aux_dir, &mut rustc);
+        self.build_all_auxiliary(&aux_dir, &mut rustc, true);
 
         rustc.envs(self.props.rustc_env.clone());
         self.props.unset_rustc_env.iter().fold(&mut rustc, Command::env_remove);
@@ -1355,34 +1371,117 @@ impl<'test> TestCx<'test> {
         output_file_path
     }
 
-    /// Builds an aux dependency.
+    /// Builds an aux dependency, or reuses a build of it made for another test.
     ///
     /// If `aux_type` is `None`, then this will determine the aux-type automatically.
+    ///
+    /// `can_share` says whether `aux_dir` is still empty, i.e. whether this is
+    /// the first auxiliary being built into it. It is set to `false` on return,
+    /// because this build has now put something in `aux_dir` that later
+    /// auxiliaries of the same test can see and use.
     fn build_auxiliary(
         &self,
         source_path: &str,
         aux_dir: &Utf8Path,
         aux_type: Option<AuxType>,
+        can_share: &mut bool,
     ) -> AuxType {
+        let can_share = mem::replace(can_share, false);
+
         let aux_path = self.resolve_aux_path(source_path);
         let mut aux_props =
             self.props.from_aux_file(&aux_path, self.variant.revision(), self.config);
         if aux_type == Some(AuxType::ProcMacro) {
             aux_props.force_host = true;
         }
-        let mut aux_dir = aux_dir.to_path_buf();
-        if aux_type == Some(AuxType::Bin) {
-            // On unix, the binary of `auxiliary/foo.rs` will be named
-            // `auxiliary/foo` which clashes with the _dir_ `auxiliary/foo`, so
-            // put bins in a `bin` subfolder.
-            aux_dir.push("bin");
+
+        // On unix, the binary of `auxiliary/foo.rs` will be named
+        // `auxiliary/foo` which clashes with the _dir_ `auxiliary/foo`, so
+        // put bins in a `bin` subfolder.
+        let bin_subdir = (aux_type == Some(AuxType::Bin)).then_some("bin");
+
+        if !(can_share && self.aux_build_is_shareable(&aux_props)) {
+            let mut out_dir = aux_dir.to_path_buf();
+            out_dir.extend(bin_subdir);
+            let (aux_type, res) =
+                self.build_auxiliary_in(&aux_path, &aux_props, &out_dir, aux_type, false);
+            if !res.status.success() {
+                self.fatal_proc_rec(
+                    &format!("auxiliary build of {aux_path} failed to compile: "),
+                    &res,
+                );
+            }
+            return aux_type;
         }
-        let aux_output = TargetLocation::ThisDirectory(aux_dir.clone());
+
+        let key = AuxKey {
+            source: aux_path.clone(),
+            revision: self.variant.revision().map(str::to_owned),
+            forced_type: aux_type,
+        };
+        let cell = self.config.aux_cache.get_or_build(
+            &self.config.build_test_suite_root,
+            key,
+            |cache_dir| {
+                let mut out_dir = cache_dir.to_path_buf();
+                out_dir.extend(bin_subdir);
+                self.build_auxiliary_in(&aux_path, &aux_props, &out_dir, aux_type, true)
+            },
+        );
+        let build: &AuxBuild = cell.get().expect("the cache entry was just initialized");
+
+        if let Some(failure) = &build.failure {
+            self.fatal_proc_rec(
+                &format!("auxiliary build of {aux_path} failed to compile: "),
+                failure,
+            );
+        }
+        build.link_into(aux_dir).unwrap_or_else(|e| {
+            panic!("failed to provide auxiliary build of {aux_path} in `{aux_dir}`: {e}")
+        });
+        build.aux_type
+    }
+
+    /// Whether a build of an auxiliary depends only on things that are part of
+    /// the auxiliary cache key, and so can be shared with the other tests that
+    /// ask for it.
+    ///
+    /// The caller separately checks that the auxiliary is the first one being
+    /// built into its directory; see [`Self::build_auxiliary`].
+    fn aux_build_is_shareable(&self, aux_props: &TestProps) -> bool {
+        // `-Zdump-mir-dir` points into the requesting test's output directory.
+        if matches!(self.config.mode, TestMode::MirOpt | TestMode::Crashes) {
+            return false;
+        }
+        // The incremental directory belongs to the requesting test, and is
+        // written to by the build.
+        if aux_props.incremental_dir.is_some() {
+            return false;
+        }
+        // `minicore` is built into the requesting test's output directory, and
+        // passed to the auxiliary with `--extern`.
+        if aux_props.add_minicore {
+            return false;
+        }
+        true
+    }
+
+    /// Compiles an aux dependency into `aux_dir`, without checking whether the
+    /// build succeeded.
+    fn build_auxiliary_in(
+        &self,
+        aux_path: &Utf8Path,
+        aux_props: &TestProps,
+        aux_dir: &Utf8Path,
+        aux_type: Option<AuxType>,
+        dir_is_empty: bool,
+    ) -> (AuxType, ProcRes) {
+        let aux_output = TargetLocation::ThisDirectory(aux_dir.to_path_buf());
         let aux_cx = TestCx {
             config: self.config,
             stdout: self.stdout,
             stderr: self.stderr,
-            props: &aux_props,
+            props: aux_props,
             testpaths: self.testpaths,
             variant: self.variant,
         };
@@ -1391,14 +1490,14 @@ impl<'test> TestCx<'test> {
         let mut aux_rustc = aux_cx.make_compile_args(
             // Always use `rustc` for aux crates, even in rustdoc tests.
             CompilerKind::Rustc,
-            &aux_path,
+            aux_path,
             aux_output,
             Emit::None,
             AllowUnused::No,
             LinkToAux::No,
             Vec::new(),
         );
-        aux_cx.build_all_auxiliary(&aux_dir, &mut aux_rustc);
+        aux_cx.build_all_auxiliary(aux_dir, &mut aux_rustc, dir_is_empty);
 
         aux_rustc.envs(aux_props.rustc_env.clone());
         for key in &aux_props.unset_rustc_env {
@@ -1451,7 +1550,7 @@ impl<'test> TestCx<'test> {
             aux_rustc.args(&["--extern", "proc_macro"]);
         }
 
-        aux_rustc.arg("-L").arg(&aux_dir);
+        aux_rustc.arg("-L").arg(aux_dir);
 
         if aux_props.add_minicore {
             let minicore_path = self.build_minicore();
@@ -1462,16 +1561,10 @@ impl<'test> TestCx<'test> {
         let auxres = aux_cx.compose_and_run(
             aux_rustc,
             aux_cx.config.host_compile_lib_path.as_path(),
-            Some(aux_dir.as_path()),
+            Some(aux_dir),
             None,
         );
-        if !auxres.status.success() {
-            self.fatal_proc_rec(
-                &format!("auxiliary build of {aux_path} failed to compile: "),
-                &auxres,
-            );
-        }
-        aux_type
+        (aux_type, auxres)
     }
 
     fn read2_abbreviated(&self, child: Child) -> (Output, Truncated) {
@@ -3075,7 +3168,7 @@ struct ProcArgs {
 
 #[derive(Debug)]
 pub(crate) struct ProcRes {
-    status: ExitStatus,
+    pub(crate) status: ExitStatus,
     stdout: String,
     stderr: String,
     truncated: Truncated,
@@ -3126,8 +3219,8 @@ enum LinkToAux {
     No,
 }
 
-#[derive(Debug, PartialEq)]
-enum AuxType {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AuxType {
     Bin,
     Lib,
     Dylib,
