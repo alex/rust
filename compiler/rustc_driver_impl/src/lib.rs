@@ -1476,7 +1476,13 @@ pub fn install_ice_hook(bug_report_url: &'static str, extra_info: fn(&DiagCtxt))
     // (e.g. `RUST_BACKTRACE=1`)
     if env::var_os("RUST_BACKTRACE").is_none() {
         // HACK: this check is extremely dumb, but we don't really need it to be smarter since this should only happen in the test suite anyway.
-        let ui_testing = std::env::args().any(|arg| arg == "-Zui-testing");
+        //
+        // Inspect the arguments of the compilation rather than the process's:
+        // under the compile server the process's belong to the server.
+        let ui_testing = match rustc_session::utils::invocation_args() {
+            Some(args) => args.iter().any(|arg| arg == "-Zui-testing"),
+            None => std::env::args().any(|arg| arg == "-Zui-testing"),
+        };
         if env!("CFG_RELEASE_CHANNEL") == "dev" && !ui_testing {
             panic::set_backtrace_style(panic::BacktraceStyle::Short);
         } else {
@@ -1719,6 +1725,7 @@ pub fn install_ctrlc_handler() {
 /// The reply is `##EXIT <code>` or, if the child was killed by a signal,
 /// `##SIGNAL <signo>`, so that tests which expect a specific exit status or a
 /// crash see exactly what they would have seen from a real process.
+#[cfg(unix)]
 fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
     fn field<'a>(parts: &mut impl Iterator<Item = &'a str>, what: &str) -> &'a str {
         parts.next().unwrap_or_else(|| panic!("compile server request has no {what}"))
@@ -1779,6 +1786,8 @@ fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
             // compilation's own arguments and environment, not the server's.
             rustc_data_structures::sync::reset_dyn_thread_safe_mode();
             reset_ice_path();
+            // Record these before installing the hook, which inspects them.
+            rustc_session::utils::set_invocation_args(&args);
             install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
 
             let code = catch_with_exit_code(|| run_compiler(&args, callbacks));
@@ -1817,6 +1826,7 @@ pub fn main() -> ExitCode {
     // Before `install_ice_hook`: it reads `RUST_BACKTRACE` as it is installed,
     // and in server mode the environment that matters belongs to each request,
     // not to the server. Children install it themselves.
+    #[cfg(unix)]
     if env::var_os("RUSTC_COMPILE_SERVER").is_some() {
         compile_server(&mut callbacks);
     }

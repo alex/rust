@@ -55,14 +55,19 @@ pub(crate) struct ServerPool {
 }
 
 impl ServerPool {
-    /// Creates a pool, if the caller asked for one.
+    /// Creates a pool, unless serving is unavailable or has been turned off.
+    ///
+    /// Serving relies on `fork`, so it is Unix-only. `COMPILETEST_NO_COMPILE_SERVER`
+    /// turns it off, which is worth reaching for if a test behaves differently
+    /// under it: that would be a bug, but the escape hatch means it need not
+    /// block anyone in the meantime.
     pub(crate) fn new(
         rustc: &Utf8Path,
         sysroot: &Utf8Path,
         target: &str,
         scratch_root: &Utf8Path,
     ) -> Option<Self> {
-        if env::var_os("COMPILETEST_COMPILE_SERVER").is_none() {
+        if !cfg!(unix) || env::var_os("COMPILETEST_NO_COMPILE_SERVER").is_some() {
             return None;
         }
         let scratch_root = scratch_root.join(".compile-server");
@@ -234,6 +239,7 @@ impl Server {
 /// Turns a `##EXIT`/`##SIGNAL` reply back into the [`ExitStatus`] the caller
 /// would have seen from a real process, so that tests asserting a particular
 /// exit code (or a crash) behave identically.
+#[cfg(unix)]
 fn parse_status(reply: &str) -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
 
@@ -246,6 +252,12 @@ fn parse_status(reply: &str) -> ExitStatus {
     } else {
         panic!("unexpected compile server reply: {reply:?}")
     }
+}
+
+#[cfg(not(unix))]
+fn parse_status(_reply: &str) -> ExitStatus {
+    // Unreachable: `ServerPool::new` returns `None` off Unix.
+    unreachable!("the compile server is Unix-only")
 }
 
 impl Drop for Server {

@@ -77,6 +77,15 @@ pub fn set_invocation_args(args: &[String]) {
     *INVOCATION_ARGS.write().unwrap() = Some(args.to_vec());
 }
 
+/// The arguments recorded by [`set_invocation_args`], if any.
+///
+/// Prefer this over `std::env::args` for anything that inspects how the
+/// compiler was invoked: the two agree for a normal invocation, but only this
+/// one is right when the compilation does not own the process.
+pub fn invocation_args() -> Option<Vec<String>> {
+    INVOCATION_ARGS.read().unwrap().clone()
+}
+
 pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
     const ICE_REPORT_COMPILER_FLAGS: &[&str] = &["-Z", "-C", "--crate-type"];
 
