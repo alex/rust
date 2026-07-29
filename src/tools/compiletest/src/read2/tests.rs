@@ -41,24 +41,30 @@ fn test_abbreviate_long_string() {
 #[test]
 fn test_abbreviate_filterss_are_detected() {
     let mut out = ProcOutput::new();
-    let filters = &["foo".to_string(), "quux".to_string()];
+    // The filters have to be longer than the placeholder length, otherwise
+    // discounting them could never bring the output back under the threshold.
+    let filters = &["f".repeat(64), "q".repeat(64)];
 
-    out.extend(b"Hello foo", filters);
-    // Check items from a previous extension are not double-counted.
-    out.extend(b"! This is a qu", filters);
-    // Check items are detected across extensions.
-    out.extend(b"ux.", filters);
+    // The filtered length is only tracked once the raw output goes over the
+    // truncation threshold, since below it the filters cannot change the
+    // outcome. So make sure the output does go over it.
+    out.extend(&vec![b'.'; MAX_OUT_LEN - 64], filters);
+    out.extend(filters[0].as_bytes(), filters);
+    // Check items are detected across extensions, and that items from a
+    // previous extension are not double-counted.
+    out.extend(&filters[1].as_bytes()[..32], filters);
+    out.extend(&filters[1].as_bytes()[32..], filters);
 
     match &out {
         ProcOutput::Full { bytes, filtered_len } => assert_eq!(
             *filtered_len,
-            bytes.len() + FILTERED_PATHS_PLACEHOLDER_LEN * filters.len()
-                - filters.iter().map(|i| i.len()).sum::<usize>()
+            Some(
+                bytes.len() + FILTERED_PATHS_PLACEHOLDER_LEN * filters.len()
+                    - filters.iter().map(|i| i.len()).sum::<usize>()
+            )
         ),
         ProcOutput::Abbreviated { .. } => panic!("out should not be abbreviated"),
     }
-
-    assert_eq!(b"Hello foo! This is a quux.", &*out.into_bytes());
 }
 
 #[test]

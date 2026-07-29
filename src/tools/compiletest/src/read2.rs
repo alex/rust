@@ -48,13 +48,26 @@ const MAX_OUT_LEN: usize = 512 * 1024;
 const FILTERED_PATHS_PLACEHOLDER_LEN: usize = 32;
 
 enum ProcOutput {
-    Full { bytes: Vec<u8>, filtered_len: usize },
-    Abbreviated { head: Vec<u8>, skipped: usize },
+    /// `filtered_len` is the output length used to decide whether to truncate,
+    /// with known paths discounted (see [`ProcOutput::extend`]).
+    ///
+    /// It is `None` until the raw output first exceeds [`MAX_OUT_LEN`], because
+    /// truncation needs *both* lengths to be over the threshold: while the raw
+    /// output is still small, the filtered length cannot affect the outcome and
+    /// so is not worth scanning for.
+    Full {
+        bytes: Vec<u8>,
+        filtered_len: Option<usize>,
+    },
+    Abbreviated {
+        head: Vec<u8>,
+        skipped: usize,
+    },
 }
 
 impl ProcOutput {
     fn new() -> Self {
-        ProcOutput::Full { bytes: Vec::new(), filtered_len: 0 }
+        ProcOutput::Full { bytes: Vec::new(), filtered_len: None }
     }
 
     fn truncated(&self) -> bool {
@@ -66,7 +79,15 @@ impl ProcOutput {
             ProcOutput::Full { ref mut bytes, ref mut filtered_len } => {
                 let old_len = bytes.len();
                 bytes.extend_from_slice(data);
-                *filtered_len += data.len();
+                let new_len = bytes.len();
+
+                // Truncation below needs both the raw and the filtered length to be over
+                // the threshold, so while the raw output is still small there is no point
+                // in scanning for filtered paths. This is by far the common case: almost
+                // every test produces a few kilobytes of output at most.
+                if new_len <= MAX_OUT_LEN {
+                    return;
+                }
 
                 // We had problems in the past with tests failing only in some environments,
                 // due to the length of the base path pushing the output size over the limit.
@@ -79,25 +100,32 @@ impl ProcOutput {
                 // The compiler emitting only excluded strings is addressed by adding a
                 // placeholder size for each excluded segment, which will eventually reach
                 // the configured threshold.
+                //
+                // If this is the first time we go over the threshold we have skipped the
+                // scan so far, so the whole buffer has to be accounted for at once.
+                let (mut len, scanned_up_to) = match *filtered_len {
+                    Some(len) => (len + data.len(), old_len),
+                    None => (new_len, 0),
+                };
                 for path in filter_paths_from_len {
                     let path_bytes = path.as_bytes();
                     // We start matching `path_bytes - 1` into the previously loaded data,
                     // to account for the fact a path_bytes might be included across multiple
                     // `extend` calls. Starting from `- 1` avoids double-counting paths.
-                    let matches = (&bytes[(old_len.saturating_sub(path_bytes.len() - 1))..])
+                    let matches = (&bytes[(scanned_up_to.saturating_sub(path_bytes.len() - 1))..])
                         .windows(path_bytes.len())
                         .filter(|window| window == &path_bytes)
                         .count();
-                    *filtered_len -= matches * path_bytes.len();
+                    len -= matches * path_bytes.len();
 
                     // We can't just remove the length of the filtered path from the output length,
                     // otherwise a compiler emitting only filtered paths would OOM compiletest. Add
                     // a fixed placeholder length for each path to prevent that.
-                    *filtered_len += matches * FILTERED_PATHS_PLACEHOLDER_LEN;
+                    len += matches * FILTERED_PATHS_PLACEHOLDER_LEN;
                 }
+                *filtered_len = Some(len);
 
-                let new_len = bytes.len();
-                if (*filtered_len).min(new_len) <= MAX_OUT_LEN {
+                if len.min(new_len) <= MAX_OUT_LEN {
                     return;
                 }
 
