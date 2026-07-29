@@ -56,6 +56,10 @@ mod tests;
 
 const FAKE_SRC_BASE: &str = "fake-test-src-base";
 
+/// Stands in for `minicore`'s output path while hashing the command
+/// that builds it; see [`TestCx::build_minicore`].
+const MINICORE_OUTPUT_PLACEHOLDER: &str = "<minicore-output>";
+
 #[cfg(windows)]
 fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
     use std::sync::Mutex;
@@ -1344,11 +1348,43 @@ impl<'test> TestCx<'test> {
     /// Builds `minicore`. Returns the path to the minicore rlib within the base test output
     /// directory.
     fn build_minicore(&self) -> Utf8PathBuf {
-        let output_file_path = self.output_base_dir().join("libminicore.rlib");
+        // `minicore` is built with the requesting test's own compile flags, so
+        // two tests only share a build if those flags agree. Rather than trying
+        // to enumerate everything `make_compile_args` looks at, identify the
+        // build by the command line it produces, with a placeholder standing in
+        // for the not-yet-known output path.
+        let probe = self.minicore_command(Utf8Path::new(MINICORE_OUTPUT_PLACEHOLDER));
+        let mut hasher = DefaultHasher::new();
+        probe.get_program().hash(&mut hasher);
+        probe.get_args().for_each(|arg| arg.hash(&mut hasher));
+        let command_hash = hasher.finish();
+
+        let cell = self.config.aux_cache.get_or_build_minicore(
+            &self.config.build_test_suite_root,
+            command_hash,
+            |rlib| {
+                let rustc = self.minicore_command(rlib);
+                self.compose_and_run(rustc, self.config.host_compile_lib_path.as_path(), None, None)
+            },
+        );
+        let build = cell.get().expect("the cache entry was just initialized");
+
+        if let Some(failure) = &build.failure {
+            self.fatal_proc_rec(
+                &format!("auxiliary build of {} failed to compile: ", self.config.minicore_path),
+                failure,
+            );
+        }
+
+        build.rlib.clone()
+    }
+
+    /// The `rustc` invocation that builds `minicore` into `output_file_path`.
+    fn minicore_command(&self, output_file_path: &Utf8Path) -> Command {
         let mut rustc = self.make_compile_args(
             CompilerKind::Rustc,
             &self.config.minicore_path,
-            TargetLocation::ThisFile(output_file_path.clone()),
+            TargetLocation::ThisFile(output_file_path.to_path_buf()),
             Emit::None,
             AllowUnused::Yes,
             LinkToAux::No,
@@ -1359,16 +1395,7 @@ impl<'test> TestCx<'test> {
         rustc.arg("-Cpanic=abort");
         rustc.args(self.props.minicore_compile_flags.clone());
 
-        let res =
-            self.compose_and_run(rustc, self.config.host_compile_lib_path.as_path(), None, None);
-        if !res.status.success() {
-            self.fatal_proc_rec(
-                &format!("auxiliary build of {} failed to compile: ", self.config.minicore_path),
-                &res,
-            );
-        }
-
-        output_file_path
+        rustc
     }
 
     /// Builds an aux dependency, or reuses a build of it made for another test.
@@ -1458,8 +1485,9 @@ impl<'test> TestCx<'test> {
         if aux_props.incremental_dir.is_some() {
             return false;
         }
-        // `minicore` is built into the requesting test's output directory, and
-        // passed to the auxiliary with `--extern`.
+        // `minicore` is built with the requesting test's own flags and handed
+        // to the auxiliary with `--extern`, so the auxiliary's command line
+        // varies with who asked for it.
         if aux_props.add_minicore {
             return false;
         }

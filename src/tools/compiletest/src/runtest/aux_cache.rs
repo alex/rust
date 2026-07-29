@@ -44,11 +44,18 @@ impl AuxKey {
     fn dir(&self, suite_root: &Utf8Path) -> Utf8PathBuf {
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
-        let stem = self.source.file_stem().unwrap_or("aux");
-        // Test output directories are named after test files, which never start
-        // with a `.`, so this cannot collide with one.
-        suite_root.join(".aux-cache").join(format!("{stem}-{:016x}", hasher.finish()))
+        shared_dir(suite_root, self.source.file_stem().unwrap_or("aux"), hasher.finish())
     }
+}
+
+/// Directory holding a shared build identified by `stem` and `hash`.
+///
+/// The stem is only there to make the build directory easier to read; the hash
+/// is what keeps distinct builds apart.
+fn shared_dir(suite_root: &Utf8Path, stem: &str, hash: u64) -> Utf8PathBuf {
+    // Test output directories are named after test files, which never start
+    // with a `.`, so this cannot collide with one.
+    suite_root.join(".aux-cache").join(format!("{stem}-{hash:016x}"))
 }
 
 /// A completed auxiliary build, kept around so that other tests needing the
@@ -109,9 +116,51 @@ impl AuxBuild {
 #[derive(Debug, Default)]
 pub(crate) struct AuxCache {
     entries: Mutex<HashMap<AuxKey, Arc<OnceLock<AuxBuild>>>>,
+    minicore: Mutex<HashMap<u64, Arc<OnceLock<MinicoreBuild>>>>,
+}
+
+/// A completed `minicore` build.
+#[derive(Debug)]
+pub(crate) struct MinicoreBuild {
+    /// Path of the built rlib.
+    pub(crate) rlib: Utf8PathBuf,
+    /// The failed `rustc` invocation, if the build did not succeed.
+    pub(crate) failure: Option<ProcRes>,
 }
 
 impl AuxCache {
+    /// Returns the shared `minicore` build for `command_hash`, performing it
+    /// with `build` if this is the first time it has been asked for.
+    ///
+    /// Unlike auxiliary crates, `minicore` is handed to the compiler by an
+    /// explicit `--extern` path rather than found on the library search path,
+    /// so it does not need to be linked into each test's directory: tests can
+    /// point straight at the shared copy.
+    pub(crate) fn get_or_build_minicore(
+        &self,
+        suite_root: &Utf8Path,
+        command_hash: u64,
+        build: impl FnOnce(&Utf8Path) -> ProcRes,
+    ) -> Arc<OnceLock<MinicoreBuild>> {
+        let cell = {
+            let mut entries = self.minicore.lock().unwrap();
+            Arc::clone(entries.entry(command_hash).or_default())
+        };
+
+        cell.get_or_init(|| {
+            let dir = shared_dir(suite_root, "minicore", command_hash);
+            remove_and_create_dir_all(&dir).unwrap_or_else(|e| {
+                panic!("failed to remove and recreate minicore directory `{dir}`: {e}")
+            });
+            let rlib = dir.join("libminicore.rlib");
+            let res = build(&rlib);
+            let failure = (!res.status.success()).then_some(res);
+            MinicoreBuild { rlib, failure }
+        });
+
+        cell
+    }
+
     /// Returns the shared build for `key`, performing it with `build` if this
     /// is the first time it has been asked for.
     ///
