@@ -1595,7 +1595,9 @@ impl<'test> TestCx<'test> {
         (aux_type, auxres)
     }
 
-    fn read2_abbreviated(&self, child: Child) -> (Output, Truncated) {
+    /// Paths that don't count towards the output truncation threshold; see
+    /// [`crate::read2`].
+    fn filter_paths(&self) -> Vec<String> {
         let mut filter_paths_from_len = Vec::new();
         let mut add_path = |path: &Utf8Path| {
             let path = path.to_string();
@@ -1614,7 +1616,11 @@ impl<'test> TestCx<'test> {
         add_path(&self.config.src_test_suite_root);
         add_path(&self.config.build_test_suite_root);
 
-        read2_abbreviated(child, &filter_paths_from_len).expect("failed to read output")
+        filter_paths_from_len
+    }
+
+    fn read2_abbreviated(&self, child: Child) -> (Output, Truncated) {
+        read2_abbreviated(child, &self.filter_paths()).expect("failed to read output")
     }
 
     fn compose_and_run(
@@ -1635,6 +1641,34 @@ impl<'test> TestCx<'test> {
         // Need to be sure to put both the lib_path and the aux path in the dylib
         // search path for the child.
         add_dylib_path(&mut command, iter::once(lib_path).chain(aux_path));
+
+        // Hand plain `rustc` invocations to a resident compiler instead of
+        // paying for a fresh process. Anything that feeds the child stdin, or
+        // that isn't `rustc` (rustdoc, the compiled test binaries, tools), goes
+        // the normal way.
+        if let Some(server) = &self.config.compile_server
+            && input.is_none()
+            && command.get_program() == self.config.rustc_path.as_std_path()
+        {
+            let served = server.run(&command);
+            let (stdout, stderr, truncated) =
+                crate::read2::abbreviate(served.stdout, served.stderr, &self.filter_paths());
+            let result = ProcRes {
+                status: served.status,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                truncated,
+                cmdline,
+            };
+            self.dump_output(
+                self.config.verbose
+                    || (!result.status.success() && self.config.mode != TestMode::Ui),
+                &command.get_program().to_string_lossy(),
+                &result.stdout,
+                &result.stderr,
+            );
+            return result;
+        }
 
         let mut child = disable_error_reporting(|| command.spawn())
             .unwrap_or_else(|e| panic!("failed to exec `{command:?}`: {e:?}"));

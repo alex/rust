@@ -60,6 +60,20 @@ impl CanonicalizedPath {
 /// This function is used during ICEs to show more information useful for
 /// debugging, since some ICEs only happens with non-default compiler flags
 /// (and the users don't always report them).
+/// The arguments of the compilation currently being run, as passed to
+/// `run_compiler`.
+///
+/// This is normally the same as the process's `argv`, and is only recorded
+/// separately because it need not be: under `rustc`'s compile server a
+/// compilation runs in a process whose `argv` belongs to the server, not to the
+/// compilation. ICE reports want the latter.
+static INVOCATION_ARGS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Records the arguments of the compilation about to run, for ICE reports.
+pub fn set_invocation_args(args: &[String]) {
+    let _ = INVOCATION_ARGS.set(args.to_vec());
+}
+
 pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
     const ICE_REPORT_COMPILER_FLAGS: &[&str] = &["-Z", "-C", "--crate-type"];
 
@@ -67,7 +81,14 @@ pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
 
     const ICE_REPORT_COMPILER_FLAGS_STRIP_VALUE: &[&str] = &["incremental"];
 
-    let mut args = std::env::args_os().map(|arg| arg.to_string_lossy().to_string());
+    let invocation_args;
+    let mut args: Box<dyn Iterator<Item = String>> = match INVOCATION_ARGS.get() {
+        Some(args) => {
+            invocation_args = args.clone();
+            Box::new(invocation_args.into_iter())
+        }
+        None => Box::new(std::env::args_os().map(|arg| arg.to_string_lossy().to_string())),
+    };
 
     let mut result = Vec::new();
     let mut excluded_cargo_defaults = false;

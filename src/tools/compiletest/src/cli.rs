@@ -9,6 +9,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 
 use crate::common::{CodegenBackend, CompareMode, Config, ForcePassMode, TestMode, TestSuite};
+use crate::compile_server::ServerPool;
 use crate::edition::Edition;
 use crate::{debuggers, directives, early_config_check, run_tests};
 
@@ -385,6 +386,8 @@ pub(crate) fn parse_config(args: Vec<String>) -> Config {
     let iteration_count = args.iteration_count.unwrap_or(Config::DEFAULT_ITERATION_COUNT);
     assert!(iteration_count > 0, "`--iteration-count` must be a positive integer");
 
+    let compile_server = ServerPool::new(&args.rustc_path, &build_test_suite_root).map(Arc::new);
+
     Config {
         bless: args.bless,
         fail_fast: args.fail_fast || env::var_os("RUSTC_TEST_FAIL_FAST").is_some(),
@@ -498,6 +501,8 @@ pub(crate) fn parse_config(args: Vec<String>) -> Config {
 
         parallel_frontend_threads,
         iteration_count,
+
+        compile_server,
 
         aux_cache: Default::default(),
     }

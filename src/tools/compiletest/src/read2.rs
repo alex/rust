@@ -15,6 +15,21 @@ pub(crate) enum Truncated {
     No,
 }
 
+/// Applies the same truncation as [`read2_abbreviated`] to output that was
+/// collected some other way (see the compile server).
+pub(crate) fn abbreviate(
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    filter_paths_from_len: &[String],
+) -> (Vec<u8>, Vec<u8>, Truncated) {
+    let mut out = ProcOutput::new();
+    out.extend(&stdout, filter_paths_from_len);
+    let mut err = ProcOutput::new();
+    err.extend(&stderr, filter_paths_from_len);
+    let truncated = if out.truncated() || err.truncated() { Truncated::Yes } else { Truncated::No };
+    (out.into_bytes(), err.into_bytes(), truncated)
+}
+
 pub(crate) fn read2_abbreviated(
     mut child: Child,
     filter_paths_from_len: &[String],

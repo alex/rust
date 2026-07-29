@@ -169,6 +169,10 @@ impl Callbacks for TimePassesCallbacks {
 
 /// This is the primary entry point for rustc.
 pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) {
+    // Record these for ICE reports, which would otherwise read the process's
+    // `argv` -- not the same thing when running under the compile server.
+    rustc_session::utils::set_invocation_args(at_args);
+
     let mut default_early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // Throw away the first argument, the name of the binary.
@@ -1659,6 +1663,114 @@ pub fn install_ctrlc_handler() {
     .expect("Unable to install ctrlc handler");
 }
 
+/// Serves compilations by forking an already-initialised process.
+///
+/// A `rustc` process spends a fixed ~17ms on `execve`, dynamic loading, page
+/// faults and teardown before and after doing any work. A test suite that runs
+/// tens of thousands of tiny compilations pays that over and over. In server
+/// mode the compiler initialises once, warms itself with a throwaway
+/// compilation so that everything it touches stays resident, and then forks
+/// per request: the child inherits the warm address space copy-on-write and
+/// starts compiling immediately.
+///
+/// The server deliberately never compiles anything itself. Doing so would warm
+/// its pages further, but it would also initialise one-shot globals -- the
+/// `-Z threads` mode, the ICE dump path -- that every later child would then
+/// inherit instead of setting from its own arguments. Children set them in
+/// their own copy-on-write memory, so forking from a pristine server keeps each
+/// compilation exactly as isolated as its own process was.
+///
+/// The protocol is deliberately minimal, and is spoken over stdin (which the
+/// client makes a socketpair so it can be read from and written to). One
+/// request per line, fields separated by `\x01`:
+///
+/// ```text
+/// <cwd> \x01 <stdout path> \x01 <stderr path> \x01 <env> \x01 <args>
+/// ```
+///
+/// where `<env>` and `<args>` are themselves `\x02`-separated, and `<env>`
+/// entries are `KEY=VALUE`.
+///
+/// The reply is `##EXIT <code>` or, if the child was killed by a signal,
+/// `##SIGNAL <signo>`, so that tests which expect a specific exit status or a
+/// crash see exactly what they would have seen from a real process.
+fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
+    fn field<'a>(parts: &mut impl Iterator<Item = &'a str>, what: &str) -> &'a str {
+        parts.next().unwrap_or_else(|| panic!("compile server request has no {what}"))
+    }
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if io::stdin().read_line(&mut line).expect("failed to read compile server request") == 0 {
+            std::process::exit(0);
+        }
+
+        let mut parts = line.trim_end_matches('\n').split('\x01');
+        let cwd = field(&mut parts, "cwd");
+        let stdout_path = field(&mut parts, "stdout path");
+        let stderr_path = field(&mut parts, "stderr path");
+        let env = field(&mut parts, "env");
+        let args: Vec<String> =
+            field(&mut parts, "args").split('\x02').map(str::to_owned).collect();
+
+        // SAFETY: the server is single-threaded, and everything the child does
+        // before handing over to the compiler is async-signal-safe or covered
+        // by the allocator's `pthread_atfork` handlers.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            panic!("compile server could not fork: {}", io::Error::last_os_error());
+        }
+        if pid == 0 {
+            let redirect = |path: &str, fd: i32| {
+                let file = File::create(path)
+                    .unwrap_or_else(|e| panic!("compile server could not open {path}: {e}"));
+                // SAFETY: `file` is a valid open file descriptor.
+                unsafe { libc::dup2(std::os::unix::io::AsRawFd::as_raw_fd(&file), fd) };
+            };
+            redirect(stdout_path, 1);
+            redirect(stderr_path, 2);
+
+            env::set_current_dir(cwd)
+                .unwrap_or_else(|e| panic!("compile server could not enter {cwd}: {e}"));
+            for (key, _) in env::vars_os().collect::<Vec<_>>() {
+                // SAFETY: single-threaded child.
+                unsafe { env::remove_var(key) };
+            }
+            for entry in env.split('\x02').filter(|e| !e.is_empty()) {
+                let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
+                // SAFETY: single-threaded child.
+                unsafe { env::set_var(key, value) };
+            }
+
+            // The ICE hook reads `RUST_BACKTRACE` when it is installed, so it
+            // has to be reinstalled now that this compilation's environment is
+            // in place -- the server installed it under its own.
+            install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
+
+            let code = catch_with_exit_code(|| run_compiler(&args, callbacks));
+            io::stdout().flush().ok();
+            io::stderr().flush().ok();
+            std::process::exit(if format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS) {
+                0
+            } else {
+                1
+            });
+        }
+
+        let mut status = 0i32;
+        // SAFETY: `pid` is the child we just forked.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let reply = if libc::WIFSIGNALED(status) {
+            format!("##SIGNAL {}", libc::WTERMSIG(status))
+        } else {
+            format!("##EXIT {}", libc::WEXITSTATUS(status))
+        };
+        write!(io::stdout(), "{reply}\n").unwrap();
+        io::stdout().flush().unwrap();
+    }
+}
+
 pub fn main() -> ExitCode {
     let start_time = Instant::now();
     let start_rss = get_resident_set_size();
@@ -1668,6 +1780,14 @@ pub fn main() -> ExitCode {
     init_rustc_env_logger(&early_dcx);
     signal_handler::install();
     let mut callbacks = TimePassesCallbacks::default();
+
+    // Before `install_ice_hook`: it reads `RUST_BACKTRACE` as it is installed,
+    // and in server mode the environment that matters belongs to each request,
+    // not to the server. Children install it themselves.
+    if env::var_os("RUSTC_COMPILE_SERVER").is_some() {
+        compile_server(&mut callbacks);
+    }
+
     install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
     install_ctrlc_handler();
 

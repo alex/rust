@@ -9,6 +9,7 @@ pub mod cli;
 pub mod rustdoc_gui_test;
 
 mod common;
+mod compile_server;
 mod debuggers;
 mod diagnostics;
 mod directives;

@@ -9,6 +9,7 @@ use build_helper::git::GitConfig;
 use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
 
+use crate::compile_server::ServerPool;
 use crate::debuggers::LldbVersion;
 use crate::edition::Edition;
 use crate::executor::TestVariant;
@@ -764,6 +765,9 @@ pub(crate) struct Config {
     pub(crate) parallel_frontend_threads: u32,
     /// Number of times to execute each test.
     pub(crate) iteration_count: u32,
+
+    /// Resident `rustc` servers, if compile-server mode is enabled.
+    pub(crate) compile_server: Option<Arc<ServerPool>>,
 
     /// Auxiliary crate builds shared between the tests that ask for them.
     ///
