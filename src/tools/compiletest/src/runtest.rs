@@ -2926,6 +2926,14 @@ impl<'test> TestCx<'test> {
         modes: &[CompareMode],
         require_same_modes: &[CompareMode],
     ) {
+        // Without any compare modes to examine there is nothing to prune or
+        // compare against, so don't bother reading the canonical outputs at
+        // all. This is the common case (every `ui` test takes it), and the
+        // reads are not free: there is one per entry in `UI_EXTENSIONS`.
+        if modes.is_empty() && require_same_modes.is_empty() {
+            return;
+        }
+
         for kind in UI_EXTENSIONS {
             let canon_comparison_path =
                 expected_output_path(&self.testpaths, self.variant.revision(), &None, kind);
