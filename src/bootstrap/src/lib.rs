@@ -1088,6 +1088,28 @@ impl Build {
         }
     }
 
+    /// Like [`Self::add_rust_test_threads`], but for compiletest, which wants
+    /// more workers than there are cores.
+    ///
+    /// Compiletest's work is almost entirely short-lived subprocesses: a
+    /// `rustc` per test, the linker `rustc` spawns for tests that build a
+    /// binary, and the test binaries themselves. A worker therefore spends a
+    /// noticeable share of each test off-CPU, waiting on process creation and
+    /// teardown, so one worker per core leaves cores idle for that share of the
+    /// time. Oversubscribing lets another test use the core in the meantime.
+    ///
+    /// Half again as many workers as cores captures essentially all of the
+    /// win (measured on `tests/ui`: 8% of wall clock, with total CPU time
+    /// unchanged); going further stops helping, and each additional worker is
+    /// another concurrent `rustc` worth of peak memory. Setting
+    /// `RUST_TEST_THREADS` explicitly still overrides this.
+    fn add_compiletest_test_threads(&self, cmd: &mut BootstrapCommand) {
+        if env::var_os("RUST_TEST_THREADS").is_none() {
+            let jobs = self.jobs();
+            cmd.env("RUST_TEST_THREADS", (jobs + jobs / 2).to_string());
+        }
+    }
+
     /// Returns the libdir of the snapshot compiler.
     fn rustc_snapshot_libdir(&self) -> PathBuf {
         self.rustc_snapshot_sysroot().join(libdir(self.config.host_target))

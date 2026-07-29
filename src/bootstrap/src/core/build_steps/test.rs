@@ -2797,7 +2797,7 @@ Please disable assertions with `rust.debug-assertions = false`.
         // needed when diffing test output.
         cmd.env("RUSTC_FORCE_RUSTC_VERSION", "compiletest");
         cmd.env("DOC_RUST_LANG_ORG_CHANNEL", builder.doc_rust_lang_org_channel());
-        builder.add_rust_test_threads(&mut cmd);
+        builder.add_compiletest_test_threads(&mut cmd);
 
         if builder.config.sanitizers_enabled(target) {
             cmd.env("RUSTC_SANITIZER_SUPPORT", "1");
