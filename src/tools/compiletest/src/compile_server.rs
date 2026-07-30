@@ -33,6 +33,28 @@ const ITEM: char = '\x02';
 /// this server retired; see `SERVER_DIRTY` in `rustc_driver_impl`.
 const DIRTY: &str = "##DIRTY";
 
+/// Flags that ask for something the compiler settles once per process image, so
+/// that a served compilation would get whatever the server settled on rather
+/// than what it asked for. Passing one of these means the compilation gets a
+/// process to itself; see [`ServerPool::can_serve`].
+const READ_ONCE_FLAGS: &[&str] = &[
+    // Configure LLVM, which is initialised once, for one target, with one set of
+    // arguments -- or ask it something, which needs it initialised first.
+    "-Cllvm-args",
+    "-Ctarget-cpu",
+    "-Ctarget-feature",
+    "--print",
+    // `dlopen`s the backend, which `get_codegen_sysroot` asserts happens at most
+    // once.
+    "-Zcodegen-backend",
+    // Decides, once per loaded `libproc_macro`, whether a panicking proc macro
+    // prints the panic itself. The `Once` guarding that lives in the proc-macro
+    // dylib rather than in the compiler, and `dlopen` keys dylibs by inode, so
+    // sharing an auxiliary build between tests shares the decision too: whether
+    // this works would otherwise come down to which test got there first.
+    "-Zproc-macro-backtrace",
+];
+
 /// Environment variables the compiler reads once per process image and then
 /// remembers, so that a served compilation would get whichever answer the
 /// server happened to settle on rather than its own. Setting one of these means
@@ -197,24 +219,17 @@ impl ServerPool {
     /// Whether `command` can be served, or whether it has to have a process of
     /// its own.
     ///
-    /// A warmed server has already initialised things that the compiler only
-    /// initialises once per process image and that depend on the compilation:
-    /// the codegen backend is loaded, LLVM is set up for one target with one set
-    /// of `-C llvm-args`, and the environment variables in [`READ_ONCE_ENV`] have
-    /// been read. A child cannot redo any of that, so a compilation that would
-    /// configure them differently is not interchangeable with the one the server
-    /// was warmed with, and gets a process of its own.
+    /// A warmed server has already settled things that the compiler settles once
+    /// per process image, and that a compilation might want settled differently:
+    /// the flags in [`READ_ONCE_FLAGS`] and the environment variables in
+    /// [`READ_ONCE_ENV`] all name one. A compilation cannot redo any of them, so
+    /// one that asks for a different answer than the server already has is not
+    /// interchangeable with the compilation the server was warmed with, and gets
+    /// a process of its own.
     pub(crate) fn can_serve(&self, command: &Command) -> bool {
         let mut target = None;
-        for arg in command.get_args() {
-            let arg = arg.to_string_lossy();
-            // Configures LLVM, or asks it something.
-            if arg.starts_with("-Cllvm-args")
-                || arg.starts_with("-Ctarget-cpu")
-                || arg.starts_with("-Ctarget-feature")
-                || arg.starts_with("-Zcodegen-backend")
-                || arg.starts_with("--print")
-            {
+        for arg in normalized_args(command) {
+            if READ_ONCE_FLAGS.iter().any(|once| arg.starts_with(once)) {
                 return false;
             }
             if let Some(value) = arg.strip_prefix("--target") {
@@ -321,6 +336,26 @@ impl Server {
         let stderr = fs::read(&stderr_path).unwrap_or_default();
         Some(Served { status, stdout, stderr })
     }
+}
+
+/// A command's arguments, with a bare `-C` or `-Z` joined to the value that
+/// follows it.
+///
+/// `rustc` accepts `-Zfoo=bar`, `-Z foo=bar` and `--print=foo` interchangeably,
+/// and tests use whichever reads better, so matching on the raw arguments would
+/// silently miss half of them.
+fn normalized_args(command: &Command) -> impl Iterator<Item = String> {
+    let mut args = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).peekable();
+    std::iter::from_fn(move || {
+        let arg = args.next()?;
+        Some(match arg.as_str() {
+            "-C" | "-Z" => match args.next() {
+                Some(value) => format!("{arg}{value}"),
+                None => arg,
+            },
+            _ => arg,
+        })
+    })
 }
 
 /// Turns a `##EXIT`/`##SIGNAL` reply back into the [`ExitStatus`] the caller
