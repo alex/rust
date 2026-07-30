@@ -1646,12 +1646,16 @@ impl<'test> TestCx<'test> {
         // paying for a fresh process. Anything that feeds the child stdin, or
         // that isn't `rustc` (rustdoc, the compiled test binaries, tools), goes
         // the normal way.
+        //
+        // A server can also decline a compilation it has started, if it could
+        // not keep it isolated; that one falls through and gets a process, so
+        // the result is the same either way.
         if let Some(server) = &self.config.compile_server
             && input.is_none()
             && command.get_program() == self.config.rustc_path.as_std_path()
             && server.can_serve(&command)
+            && let Some(served) = server.run(&command)
         {
-            let served = server.run(&command);
             let (stdout, stderr, truncated) =
                 crate::read2::abbreviate(served.stdout, served.stderr, &self.filter_paths());
             let result = ProcRes {

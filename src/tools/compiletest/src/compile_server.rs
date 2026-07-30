@@ -10,6 +10,12 @@
 //! Servers are pooled rather than kept per thread, because compiletest runs
 //! each test on a thread of its own and a per-thread server would be a fresh
 //! process per test again.
+//!
+//! A server can also run compilations in itself rather than forking, which is
+//! faster again but shares one process between compilations that were written
+//! expecting one each. That is not something the compiler fully supports yet, so
+//! it is off unless asked for, and a compilation that the server could not
+//! isolate is redone in a process of its own; see [`Mode`].
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -23,8 +29,55 @@ use camino::{Utf8Path, Utf8PathBuf};
 const FIELD: char = '\x01';
 /// Separates the items within the environment and argument fields.
 const ITEM: char = '\x02';
+/// Reply meaning the compilation has to be redone in a process of its own, and
+/// this server retired; see `SERVER_DIRTY` in `rustc_driver_impl`.
+const DIRTY: &str = "##DIRTY";
 
-/// A resident `rustc` that forks per compilation.
+/// Environment variables the compiler reads once per process image and then
+/// remembers, so that a served compilation would get whichever answer the
+/// server happened to settle on rather than its own. Setting one of these means
+/// the compilation gets a process to itself; see [`ServerPool::can_serve`].
+const READ_ONCE_ENV: &[&str] = &[
+    // Cached in `rustc_interface::util::STACK_SIZE`, which the server's warmup
+    // compilation has already filled in.
+    "RUST_MIN_STACK",
+    // Cached in `RustcVersion::current_overridable`, lazily, so in-process
+    // serving would let the first compilation to ask about `cfg(version)` decide
+    // for the rest.
+    "RUSTC_OVERRIDE_VERSION_STRING",
+];
+
+/// How a server runs the compilations it is sent.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Mode {
+    /// Fork per compilation, so that each one gets a process of its own -- just
+    /// one that starts from a warm address space instead of from `execve`. This
+    /// is what the fixed cost of a `rustc` process is mostly made of, so this
+    /// gets most of the win and gives up no isolation.
+    Fork,
+    /// Run compilations in the server itself, saving the `fork` and the page
+    /// faults a child takes as it writes to inherited pages.
+    ///
+    /// The compiler is nearly, but not quite, able to run repeatedly in one
+    /// process: a handful of things it records once per process image are really
+    /// per compilation, and the ones on the ICE path are still outstanding. So a
+    /// server that cannot promise the next compilation a clean process says so,
+    /// and this client redoes that compilation on its own -- which is why this
+    /// is a legitimate mode and not a correctness gamble, but also why it is not
+    /// the default.
+    InProcess,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Fork => "fork",
+            Mode::InProcess => "in-process",
+        }
+    }
+}
+
+/// A resident `rustc` that serves compilations; see [`Mode`] for how.
 #[derive(Debug)]
 struct Server {
     child: Child,
@@ -44,6 +97,7 @@ pub(crate) struct Served {
 #[derive(Debug)]
 pub(crate) struct ServerPool {
     rustc: Utf8PathBuf,
+    mode: Mode,
     /// Flags to warm a new server with, so that it loads the same standard
     /// library the tests will use.
     warmup_flags: Vec<String>,
@@ -60,7 +114,8 @@ impl ServerPool {
     /// Serving relies on `fork`, so it is Unix-only. `COMPILETEST_NO_COMPILE_SERVER`
     /// turns it off, which is worth reaching for if a test behaves differently
     /// under it: that would be a bug, but the escape hatch means it need not
-    /// block anyone in the meantime.
+    /// block anyone in the meantime. `COMPILETEST_COMPILE_SERVER=in-process`
+    /// asks for the faster, less isolated [`Mode::InProcess`].
     pub(crate) fn new(
         rustc: &Utf8Path,
         sysroot: &Utf8Path,
@@ -70,10 +125,16 @@ impl ServerPool {
         if !cfg!(unix) || env::var_os("COMPILETEST_NO_COMPILE_SERVER").is_some() {
             return None;
         }
+        let mode = match env::var("COMPILETEST_COMPILE_SERVER").as_deref() {
+            Ok("in-process") => Mode::InProcess,
+            Ok("fork") | Err(_) => Mode::Fork,
+            Ok(other) => panic!("unknown COMPILETEST_COMPILE_SERVER mode `{other}`"),
+        };
         let scratch_root = scratch_root.join(".compile-server");
         fs::create_dir_all(&scratch_root).ok()?;
         Some(Self {
             rustc: rustc.to_path_buf(),
+            mode,
             warmup_flags: vec![
                 "--sysroot".to_owned(),
                 sysroot.as_str().to_owned(),
@@ -103,7 +164,7 @@ impl ServerPool {
         fs::create_dir_all(&scratch).expect("failed to create compile server scratch directory");
 
         let mut child = Command::new(&self.rustc)
-            .env("RUSTC_COMPILE_SERVER", "1")
+            .env("RUSTC_COMPILE_SERVER", self.mode.as_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -128,7 +189,7 @@ impl ServerPool {
             server.scratch.as_str().to_owned(),
             src.as_str().to_owned(),
         ]);
-        server.request("WARMUP", "", "", &[], &args);
+        server.request("WARMUP", "", "", &[], &args).expect("compile server died while warming up");
 
         server
     }
@@ -139,10 +200,10 @@ impl ServerPool {
     /// A warmed server has already initialised things that the compiler only
     /// initialises once per process image and that depend on the compilation:
     /// the codegen backend is loaded, LLVM is set up for one target with one set
-    /// of `-C llvm-args`, and `RUST_MIN_STACK` has been read. A child cannot
-    /// redo any of that, so a compilation that would configure them differently
-    /// is not interchangeable with the one the server was warmed with, and gets
-    /// a process of its own.
+    /// of `-C llvm-args`, and the environment variables in [`READ_ONCE_ENV`] have
+    /// been read. A child cannot redo any of that, so a compilation that would
+    /// configure them differently is not interchangeable with the one the server
+    /// was warmed with, and gets a process of its own.
     pub(crate) fn can_serve(&self, command: &Command) -> bool {
         let mut target = None;
         for arg in command.get_args() {
@@ -164,23 +225,42 @@ impl ServerPool {
         if target.is_some_and(|target| target != self.target) {
             return false;
         }
-        // Read once, on first use, and then cached by the standard library.
-        !command
-            .get_envs()
-            .any(|(key, value)| key == "RUST_MIN_STACK" && value != Some("".as_ref()))
+        !command.get_envs().any(|(key, value)| {
+            READ_ONCE_ENV.iter().any(|once| key == *once) && value != Some("".as_ref())
+        })
     }
 
     /// Runs `command` on a server, returning what it would have produced as its
-    /// own process.
-    pub(crate) fn run(&self, command: &Command) -> Served {
+    /// own process, or `None` if it has to be run as one after all.
+    ///
+    /// A server only declines a compilation it has already started, which it does
+    /// when it cannot leave itself fit to run another; the compilation is then
+    /// this client's to redo. Redoing it is safe because a `rustc` invocation's
+    /// only effects are the files it writes, which the second attempt writes
+    /// again.
+    pub(crate) fn run(&self, command: &Command) -> Option<Served> {
         let mut server = self.checkout();
-        let served = server.run(command);
-        self.checkin(server);
-        served
+        match server.run(command) {
+            Some(served) => {
+                self.checkin(server);
+                Some(served)
+            }
+            // Dropping the server kills it. It told us it is no longer fit to
+            // serve, so it does not go back in the pool; the next checkout
+            // spawns a replacement.
+            None => None,
+        }
     }
 }
 
 impl Server {
+    /// Sends a request and returns the reply, or `None` if the server did not
+    /// live to give one.
+    ///
+    /// A server dying mid-compilation is only possible in [`Mode::InProcess`],
+    /// where a compilation that takes the process down -- LLVM aborting on a
+    /// fatal error, say -- takes the server with it. That is the same situation
+    /// as an explicit [`DIRTY`], so it is reported the same way.
     fn request(
         &mut self,
         cwd: &str,
@@ -188,21 +268,25 @@ impl Server {
         stderr_path: &str,
         env: &[String],
         args: &[String],
-    ) -> String {
+    ) -> Option<String> {
         let line = format!(
             "{cwd}{FIELD}{stdout_path}{FIELD}{stderr_path}{FIELD}{}{FIELD}{}\n",
             env.join(&ITEM.to_string()),
             args.join(&ITEM.to_string()),
         );
-        self.stdin.write_all(line.as_bytes()).expect("failed to send compile server request");
-        self.stdin.flush().expect("failed to flush compile server request");
+        if self.stdin.write_all(line.as_bytes()).is_err() || self.stdin.flush().is_err() {
+            return None;
+        }
 
         let mut reply = String::new();
-        self.stdout.read_line(&mut reply).expect("failed to read compile server reply");
-        reply.trim_end().to_owned()
+        match self.stdout.read_line(&mut reply) {
+            // End of file: the server is gone.
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(reply.trim_end().to_owned()),
+        }
     }
 
-    fn run(&mut self, command: &Command) -> Served {
+    fn run(&mut self, command: &Command) -> Option<Served> {
         let stdout_path = self.scratch.join("stdout");
         let stderr_path = self.scratch.join("stderr");
 
@@ -227,12 +311,15 @@ impl Server {
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().into_owned());
 
-        let reply = self.request(&cwd, stdout_path.as_str(), stderr_path.as_str(), &env, &args);
+        let reply = self.request(&cwd, stdout_path.as_str(), stderr_path.as_str(), &env, &args)?;
+        if reply == DIRTY {
+            return None;
+        }
 
         let status = parse_status(&reply);
         let stdout = fs::read(&stdout_path).unwrap_or_default();
         let stderr = fs::read(&stderr_path).unwrap_or_default();
-        Served { status, stdout, stderr }
+        Some(Served { status, stdout, stderr })
     }
 }
 

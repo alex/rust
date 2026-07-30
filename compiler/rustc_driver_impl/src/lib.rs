@@ -1701,22 +1701,51 @@ pub fn install_ctrlc_handler() {
     .expect("Unable to install ctrlc handler");
 }
 
-/// Serves compilations by forking an already-initialised process.
+/// Runs a served compilation, having already redirected output and set up the
+/// environment for it.
+///
+/// A warmed server has run a compilation, which initialises globals that must
+/// instead reflect this compilation's own arguments: the `-Z threads` mode, the
+/// ICE dump path, and the ICE hook's view of `RUST_BACKTRACE`. Clear the first
+/// two and (re-)decide the last, so that a served compilation behaves as its own
+/// process would have.
+#[cfg(unix)]
+fn serve_compilation(args: &[String], callbacks: &mut TimePassesCallbacks) -> ExitCode {
+    rustc_data_structures::sync::reset_dyn_thread_safe_mode();
+    reset_ice_path();
+    // Record these before installing the hook, which inspects them.
+    rustc_session::utils::set_invocation_args(args);
+    install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
+
+    catch_with_exit_code(|| run_compiler(args, callbacks))
+}
+
+/// Serves compilations from an already-initialised process, either by forking
+/// per compilation or by running them in the server itself.
 ///
 /// A `rustc` process spends a fixed ~17ms on `execve`, dynamic loading, page
 /// faults and teardown before and after doing any work. A test suite that runs
 /// tens of thousands of tiny compilations pays that over and over. In server
-/// mode the compiler initialises once, warms itself with a throwaway
-/// compilation so that everything it touches stays resident, and then forks
-/// per request: the child inherits the warm address space copy-on-write and
-/// starts compiling immediately.
+/// mode the compiler initialises once and warms itself with a throwaway
+/// compilation, so that everything it touches stays resident.
 ///
-/// Warming the server means it has run a compilation, which initialises globals
-/// that must instead reflect each child's own arguments: the `-Z threads` mode,
-/// the ICE dump path, and the ICE hook's view of `RUST_BACKTRACE`. Children
-/// therefore clear the first two and install the hook themselves, all of which
-/// they do in their own copy-on-write memory, so a warmed server still hands
-/// out compilations as isolated as their own processes were.
+/// There are then two ways to serve a request, and the client picks:
+///
+/// * `RUSTC_COMPILE_SERVER=fork` forks per compilation. The child inherits the
+///   warm address space copy-on-write and starts compiling immediately, and
+///   every global it goes on to dirty it dirties in its own memory, so a
+///   compilation is as isolated as its own process was. This saves the process
+///   *startup*, which is most of the fixed cost.
+/// * `RUSTC_COMPILE_SERVER=in-process` runs the compilation in the server. This
+///   additionally saves the `fork` itself and the page faults the child takes
+///   copying the pages it writes to, but the compilation now shares the
+///   server's globals with every other compilation that server has run.
+///
+/// The compiler is close to being able to run repeatedly in one process, but not
+/// all the way there, so in-process serving is recoverable rather than
+/// guaranteed: whenever a compilation leaves the process in a state the next one
+/// cannot trust, the server says so and the client re-runs that compilation on
+/// its own. See [`SERVER_DIRTY`].
 ///
 /// The protocol is deliberately minimal, and is spoken over stdin (which the
 /// client makes a socketpair so it can be read from and written to). One
@@ -1729,17 +1758,25 @@ pub fn install_ctrlc_handler() {
 /// where `<env>` and `<args>` are themselves `\x02`-separated, and `<env>`
 /// entries are `KEY=VALUE`. A request whose `cwd` is `WARMUP` is run in the
 /// server itself, so that the pages it touches -- and, more importantly, the
-/// heap the allocator has grown to hold a session -- stay resident and are
-/// inherited copy-on-write by every later child.
+/// heap the allocator has grown to hold a session -- stay resident.
 ///
-/// The reply is `##EXIT <code>` or, if the child was killed by a signal,
-/// `##SIGNAL <signo>`, so that tests which expect a specific exit status or a
-/// crash see exactly what they would have seen from a real process.
+/// The reply is `##EXIT <code>`, `##SIGNAL <signo>` if the compilation was
+/// killed by a signal, or [`SERVER_DIRTY`]. The first two are exactly what the
+/// caller would have seen from a real process, so that tests expecting a
+/// specific exit status or a crash are unaffected.
 #[cfg(unix)]
 fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
     fn field<'a>(parts: &mut impl Iterator<Item = &'a str>, what: &str) -> &'a str {
         parts.next().unwrap_or_else(|| panic!("compile server request has no {what}"))
     }
+
+    // Which of the two ways to serve the client asked for; see the doc comment.
+    let in_process = env::var_os("RUSTC_COMPILE_SERVER").is_some_and(|v| v == "in-process");
+
+    // Kept open so that an in-process compilation, which redirects them to the
+    // files the client asked for, can put them back afterwards.
+    let saved_stdout = in_process.then(|| dup_fd(1));
+    let saved_stderr = in_process.then(|| dup_fd(2));
 
     let mut line = String::new();
     loop {
@@ -1758,8 +1795,60 @@ fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
 
         if cwd == "WARMUP" {
             let _ = catch_fatal_errors(|| run_compiler(&args, callbacks));
-            write!(io::stdout(), "##EXIT 0\n").unwrap();
-            io::stdout().flush().unwrap();
+            reply("##EXIT 0");
+            continue;
+        }
+
+        let redirect = |path: &str, fd: i32| {
+            let file = File::create(path)
+                .unwrap_or_else(|e| panic!("compile server could not open {path}: {e}"));
+            // SAFETY: `file` is a valid open file descriptor, and `fd` is one we
+            // mean to replace.
+            unsafe { libc::dup2(std::os::unix::io::AsRawFd::as_raw_fd(&file), fd) };
+        };
+        let enter_request = || {
+            redirect(stdout_path, 1);
+            redirect(stderr_path, 2);
+            env::set_current_dir(cwd)
+                .unwrap_or_else(|e| panic!("compile server could not enter {cwd}: {e}"));
+            for (key, _) in env::vars_os().collect::<Vec<_>>() {
+                // SAFETY: the server is single-threaded at this point, as is a
+                // freshly forked child.
+                unsafe { env::remove_var(key) };
+            }
+            for entry in env.split('\x02').filter(|e| !e.is_empty()) {
+                let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
+                // SAFETY: as above.
+                unsafe { env::set_var(key, value) };
+            }
+        };
+
+        if in_process {
+            enter_request();
+            // A compilation that unwinds has ICEd. That leaves state behind
+            // that the next compilation would inherit -- most visibly the
+            // "have I already reported an ICE?" flag -- so hand the compilation
+            // back to the client to redo in a process of its own, and let this
+            // server be retired.
+            let code = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                serve_compilation(&args, callbacks)
+            }));
+            io::stdout().flush().ok();
+            io::stderr().flush().ok();
+            // Put stdout and stderr back before replying, since the reply goes
+            // out over stdout.
+            // SAFETY: both are file descriptors this process owns.
+            unsafe {
+                libc::dup2(*saved_stdout.as_ref().unwrap(), 1);
+                libc::dup2(*saved_stderr.as_ref().unwrap(), 2);
+            }
+            match code {
+                Ok(code) => reply(&format!("##EXIT {}", exit_code_of(code))),
+                Err(_) => {
+                    reply(SERVER_DIRTY);
+                    std::process::exit(0);
+                }
+            }
             continue;
         }
 
@@ -1771,56 +1860,51 @@ fn compile_server(callbacks: &mut TimePassesCallbacks) -> ! {
             panic!("compile server could not fork: {}", io::Error::last_os_error());
         }
         if pid == 0 {
-            let redirect = |path: &str, fd: i32| {
-                let file = File::create(path)
-                    .unwrap_or_else(|e| panic!("compile server could not open {path}: {e}"));
-                // SAFETY: `file` is a valid open file descriptor.
-                unsafe { libc::dup2(std::os::unix::io::AsRawFd::as_raw_fd(&file), fd) };
-            };
-            redirect(stdout_path, 1);
-            redirect(stderr_path, 2);
-
-            env::set_current_dir(cwd)
-                .unwrap_or_else(|e| panic!("compile server could not enter {cwd}: {e}"));
-            for (key, _) in env::vars_os().collect::<Vec<_>>() {
-                // SAFETY: single-threaded child.
-                unsafe { env::remove_var(key) };
-            }
-            for entry in env.split('\x02').filter(|e| !e.is_empty()) {
-                let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
-                // SAFETY: single-threaded child.
-                unsafe { env::set_var(key, value) };
-            }
-
-            // Clear what a warmup left behind: these must come from this
-            // compilation's own arguments and environment, not the server's.
-            rustc_data_structures::sync::reset_dyn_thread_safe_mode();
-            reset_ice_path();
-            // Record these before installing the hook, which inspects them.
-            rustc_session::utils::set_invocation_args(&args);
-            install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
-
-            let code = catch_with_exit_code(|| run_compiler(&args, callbacks));
+            enter_request();
+            let code = serve_compilation(&args, callbacks);
             io::stdout().flush().ok();
             io::stderr().flush().ok();
-            std::process::exit(if format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS) {
-                0
-            } else {
-                1
-            });
+            std::process::exit(exit_code_of(code));
         }
 
         let mut status = 0i32;
         // SAFETY: `pid` is the child we just forked.
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let reply = if libc::WIFSIGNALED(status) {
-            format!("##SIGNAL {}", libc::WTERMSIG(status))
+        if libc::WIFSIGNALED(status) {
+            reply(&format!("##SIGNAL {}", libc::WTERMSIG(status)));
         } else {
-            format!("##EXIT {}", libc::WEXITSTATUS(status))
-        };
-        write!(io::stdout(), "{reply}\n").unwrap();
-        io::stdout().flush().unwrap();
+            reply(&format!("##EXIT {}", libc::WEXITSTATUS(status)));
+        }
     }
+}
+
+/// Reply telling the client that this server can no longer be trusted with a
+/// compilation, and that the one it just asked for has to be redone elsewhere.
+///
+/// Sent when an in-process compilation ICEs. The client also treats the server
+/// going away without a reply as this, which covers a compilation that took the
+/// process down with it -- by aborting, say, as LLVM does on a fatal error.
+#[cfg(unix)]
+pub const SERVER_DIRTY: &str = "##DIRTY";
+
+#[cfg(unix)]
+fn reply(reply: &str) {
+    write!(io::stdout(), "{reply}\n").expect("failed to send compile server reply");
+    io::stdout().flush().expect("failed to flush compile server reply");
+}
+
+#[cfg(unix)]
+fn dup_fd(fd: i32) -> i32 {
+    // SAFETY: `fd` is one of this process's standard descriptors.
+    let copy = unsafe { libc::dup(fd) };
+    assert!(copy >= 0, "compile server could not save fd {fd}: {}", io::Error::last_os_error());
+    copy
+}
+
+/// The exit status a `rustc` process would have had after producing `code`.
+#[cfg(unix)]
+fn exit_code_of(code: ExitCode) -> i32 {
+    if format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS) { 0 } else { 1 }
 }
 
 pub fn main() -> ExitCode {
