@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 
 use rustc_data_structures::profiling::VerboseTimingGuard;
 use rustc_fs_util::try_canonicalize;
@@ -137,12 +137,14 @@ pub fn extra_compiler_flags() -> Option<(Vec<String>, bool)> {
 /// To be used in diagnostics to avoid printing Cargo specific suggestions to other
 /// build systems (like Bazel, Buck2, Makefile, ...).
 pub fn was_invoked_from_cargo() -> bool {
-    static FROM_CARGO: OnceLock<bool> = OnceLock::new();
-
     // To be able to detect Cargo, we use the simplest and least intrusive
     // way: we check whenever the `CARGO_CRATE_NAME` env is set.
     //
     // Note that it is common in Makefiles to define the `CARGO` env even
     // though we may not have been called by Cargo, so we avoid using it.
-    *FROM_CARGO.get_or_init(|| std::env::var_os("CARGO_CRATE_NAME").is_some())
+    //
+    // Deliberately not cached in a `static`: a driver that runs more than one
+    // compilation in a process would then answer for whichever ran first. This
+    // is only reached while emitting a diagnostic, so one `var_os` is cheap.
+    std::env::var_os("CARGO_CRATE_NAME").is_some()
 }

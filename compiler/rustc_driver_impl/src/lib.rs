@@ -1490,6 +1490,16 @@ pub fn install_ice_hook(bug_report_url: &'static str, extra_info: fn(&DiagCtxt))
         }
     }
 
+    // Wrap the existing hook only once per process. `update_hook` nests, so
+    // calling this repeatedly -- as a driver that runs more than one
+    // compilation does -- would otherwise report each ICE once per call.
+    // Re-deciding the backtrace style above is fine and wanted; re-wrapping is
+    // not.
+    static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+    if HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     panic::update_hook(Box::new(
         move |default_hook: &(dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static),
               info: &PanicHookInfo<'_>| {
